@@ -1,3 +1,4 @@
+# metal_rookie_bot.py
 import os
 import asyncio
 import logging
@@ -21,7 +22,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 # =====================
 PREFIX = "!"
 JST = timezone(timedelta(hours=9))
-START_ANCHOR = datetime(2025, 10, 16, 12, 0, 0, tzinfo=JST)
+START_ANCHOR = datetime(2025, 10, 16, 12, 0, 0, tzinfo=JST)  # アンカーはJST
 INTERVAL = timedelta(hours=2, minutes=30)
 
 MESSAGE_MAIN = "🪙 メタルーキーの時間です！"
@@ -36,29 +37,34 @@ logger = logging.getLogger("metal-rookie-bot")
 # =====================
 # ユーティリティ
 # =====================
-
 def to_jst(dt: datetime) -> datetime:
-    """任意の datetime を JST に変換（tz なしなら JST を付与）。"""
+    """
+    任意の datetime を JST に変換。
+    - tzなし(naive)は「UTCの値」とみなしてからJSTへ変換（コンテナがUTCでもズレない）
+    - tzあり(aware)はそのTZからJSTへ変換
+    """
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=JST)
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(JST)
 
 
 def now_jst() -> datetime:
-    return to_jst(datetime.now())
+    """UTCの現在時刻をJSTへ変換（システムローカルTZに依存しない）。"""
+    return datetime.now(timezone.utc).astimezone(JST)
 
 
 def normalize_anchor(anchor: datetime) -> datetime:
+    """アンカーをJSTへ正規化（既にJSTでも安全にそのまま返る）。"""
     return to_jst(anchor)
 
 
-def next_boundary_after(now_jst: datetime, anchor_jst: datetime, interval: timedelta) -> datetime:
-    """アンカー基準の次の境界（anchor + n*interval、境界上なら now_jst）。"""
-    if now_jst <= anchor_jst:
+def next_boundary_after(now_jst_val: datetime, anchor_jst: datetime, interval: timedelta) -> datetime:
+    """アンカー基準の次の境界（anchor + n*interval、境界上なら now_jst_val）。"""
+    if now_jst_val <= anchor_jst:
         return anchor_jst
-    elapsed = now_jst - anchor_jst
+    elapsed = now_jst_val - anchor_jst
     remainder = elapsed - (elapsed // interval) * interval
-    return now_jst if remainder == timedelta(0) else now_jst + (interval - remainder)
+    return now_jst_val if remainder == timedelta(0) else now_jst_val + (interval - remainder)
 
 
 def compute_next_event(
@@ -99,11 +105,9 @@ def human_delta(td: timedelta) -> str:
         return f"{m}分{s}秒"
     return f"{s}秒"
 
-
 # =====================
 # SQLite: 設定の永続化（3〜15分の事前通知）
 # =====================
-
 class SettingsStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -144,15 +148,12 @@ class SettingsStore:
             )
             conn.commit()
 
-
 store = SettingsStore(DB_PATH)
 CONFIG_UPDATED = asyncio.Event()  # 設定変更をスケジューラへ即時反映
-
 
 # =====================
 # Discord クライアント（!コマンド）
 # =====================
-
 def make_intents() -> discord.Intents:
     intents = discord.Intents.default()
     intents.message_content = True  # これがないと !コマンド検知できません
@@ -160,16 +161,13 @@ def make_intents() -> discord.Intents:
     intents.guilds = True           # 明示
     return intents
 
-
 bot = commands.Bot(command_prefix=PREFIX, intents=make_intents(), help_command=None)
-
 
 async def ensure_channel(client: discord.Client, channel_id: int) -> discord.abc.Messageable:
     ch = client.get_channel(channel_id)
     if ch is None:
         ch = await client.fetch_channel(channel_id)
     return ch
-
 
 async def safe_send(channel: discord.abc.Messageable, content: str) -> None:
     """送信＋例外処理（ログは日本語）。"""
@@ -178,7 +176,6 @@ async def safe_send(channel: discord.abc.Messageable, content: str) -> None:
         logger.info("メッセージを送信しました。")
     except Exception as e:
         logger.exception(f"メッセージの送信に失敗しました: {e}")
-
 
 def build_help_text(lead_minutes: int) -> str:
     return "\n".join(
@@ -192,7 +189,6 @@ def build_help_text(lead_minutes: int) -> str:
             f"• `{PREFIX}help` — このヘルプを表示",
         ]
     )
-
 
 # =====================
 # スケジューラ
@@ -212,7 +208,7 @@ async def scheduler() -> None:
         lead = store.get_lead_minutes()
         next_time, kind, boundary, lead_used = compute_next_event(now, anchor, INTERVAL, lead)
 
-        # 次の通知予定をログ出力
+        # 次の通知予定をログ出力（JST基準）
         logger.info(
             "次の通知時刻(JST): %s / 種別=%s / 事前=%s分前",
             next_time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -250,7 +246,6 @@ async def scheduler() -> None:
             lead_after,
         )
 
-
 # =====================
 # コマンド
 # =====================
@@ -260,7 +255,6 @@ async def notice_get(ctx: commands.Context) -> None:
     store.ensure()
     m = store.get_lead_minutes()
     await ctx.reply(f"ℹ️ 現在の事前通知は **{m} 分前**です。", mention_author=False)
-
 
 @bot.command(name="notice_set")
 async def notice_set_cmd(ctx: commands.Context, minutes: int | None = None) -> None:
@@ -286,7 +280,6 @@ async def notice_set_cmd(ctx: commands.Context, minutes: int | None = None) -> N
     except Exception as e:
         logger.exception(e)
         await ctx.reply("❌ 設定に失敗しました。ログを確認してください。", mention_author=False)
-
 
 @bot.command(name="next")
 async def next_cmd(ctx: commands.Context) -> None:
@@ -314,14 +307,12 @@ async def next_cmd(ctx: commands.Context) -> None:
     )
     await ctx.reply(text, mention_author=False)
 
-
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context) -> None:
     """コマンド一覧を表示"""
     store.ensure()
     lead = store.get_lead_minutes()
     await ctx.reply(build_help_text(lead), mention_author=False)
-
 
 # =====================
 # イベント
@@ -342,7 +333,6 @@ async def on_ready():
 
     # スケジューラ起動
     asyncio.create_task(scheduler())
-
 
 # =====================
 # エントリポイント
