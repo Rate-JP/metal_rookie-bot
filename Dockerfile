@@ -6,29 +6,38 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+# 起動スクリプトを環境変数で差し替え可能に
+# 既定は metal_rookie_bot.py
+ENV PY_ENTRYPOINT=metal_rookie_bot.py
+
 WORKDIR /app
 
-# ---- (任意) OSレイヤを軽く整備：証明書/基本ツール ----
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+# ---- (任意) ベース整備 ----
+# ca-certificates は HTTPS アクセスや一部ライブラリであると安心
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 # ---- Python deps ----
-# discord.py は "discord" モジュール名でimportされます
-# aiohttp はウェブサーバ用に明示的に入れておきます
-RUN pip install --upgrade pip && \
-    pip install "discord.py>=2.4,<3.0" "aiohttp>=3.9,<4.0"
+# 既存の requirements.txt を利用（ファイルがある前提）
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 # ---- App ----
-# ※ このDockerfileと同じ階層に app.py を置いてください
 COPY . .
 
-# ---- Webヘルスチェック用のポート（コード側のデフォルトは 8080）----
+# ---- Webヘルスチェック用ポート（コードのデフォルトは 8080）----
 EXPOSE 8080
 
-# ---- コンテナのヘルスチェック（Northflankの外形監視にも有益）----
+# ---- コンテナのヘルスチェック ----
+# Northflank のヘルスチェックにも使えるよう、ローカルHTTPを叩く
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\",\"8080\")}').read()" || exit 1
+  CMD python - <<'PY' || exit 1
+import os, urllib.request
+port = os.getenv("PORT", "8080")
+urllib.request.urlopen(f"http://127.0.0.1:{port}/").read()
+PY
 
 # ---- Start ----
-# 例: スクリプト名が main.py なら ["python","-u","main.py"] に変更
-CMD ["python", "-u", "app.py"]
+# 環境変数の PY_ENTRYPOINT（既定: metal_rookie_bot.py）を起動
+SHELL ["/bin/sh", "-lc"]
+CMD python -u "${PY_ENTRYPOINT}"
