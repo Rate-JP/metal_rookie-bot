@@ -1,14 +1,19 @@
-# metal_rookie_bot.py
+# metal_rookie_bot.py  — Excel(.xlsx) 保存版
 import os
 import asyncio
 import logging
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Tuple
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# Excel(.xlsx)
+try:
+    from openpyxl import Workbook, load_workbook
+except ImportError as e:
+    raise SystemExit("openpyxl が必要です。`pip install openpyxl` を実行してください。") from e
 
 # =====================
 # .env
@@ -26,7 +31,8 @@ START_ANCHOR = datetime(2025, 10, 16, 12, 0, 0, tzinfo=JST)  # アンカーはJS
 INTERVAL = timedelta(hours=2, minutes=30)
 
 MESSAGE_MAIN = "🪙 メタルーキーの時間です！"
-DB_PATH = "data.db"  # 自動作成
+EXCEL_PATH = "metal_rookie_bot.xlsx"  # 自動作成
+SHEET_NAME = "settings"
 
 # =====================
 # ログ設定
@@ -106,49 +112,96 @@ def human_delta(td: timedelta) -> str:
     return f"{s}秒"
 
 # =====================
-# SQLite: 設定の永続化（3〜15分の事前通知）
+# Excel(.xlsx): 設定の永続化（3〜15分の事前通知）
+#  - .xlsx は内部XMLがUTF-8。書込時は UTF-8 でエンコード可能か検証してから保存します。
 # =====================
 class SettingsStore:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, xlsx_path: str, sheet_name: str = SHEET_NAME):
+        self.xlsx_path = xlsx_path
+        self.sheet_name = sheet_name
+
+    @staticmethod
+    def _utf8(s: str) -> str:
+        """UTF-8でエンコード可能か検証（明示的UTF-8対応）。"""
+        if s is None:
+            s = ""
+        if not isinstance(s, str):
+            s = str(s)
+        # ここで例外が出ればUTF-8不可のため上位で扱う
+        s.encode("utf-8")
+        return s
 
     def ensure(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    id INTEGER PRIMARY KEY CHECK (id=1),
-                    lead_minutes INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO settings (id, lead_minutes, updated_at)
-                VALUES (1, 5, datetime('now'))
-                """
-            )
-            conn.commit()
+        """Excelファイル/シートと初期行を用意。"""
+        if not os.path.exists(self.xlsx_path):
+            wb = Workbook()
+            ws = wb.active
+            ws.title = self.sheet_name
+            ws.append(["id", "lead_minutes", "updated_at", "encoding"])
+            ws.append([1, 5, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+            wb.save(self.xlsx_path)
+            return
+
+        wb = load_workbook(self.xlsx_path)
+        if self.sheet_name not in wb.sheetnames:
+            ws = wb.create_sheet(self.sheet_name)
+            ws.append(["id", "lead_minutes", "updated_at", "encoding"])
+            ws.append([1, 5, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+            wb.save(self.xlsx_path)
+            return
+
+        ws = wb[self.sheet_name]
+        # ヘッダが無い/壊れている場合に補修
+        if ws.max_row == 0:
+            ws.append(["id", "lead_minutes", "updated_at", "encoding"])
+        # id=1 の行がなければ作る
+        has_row = False
+        for row in ws.iter_rows(min_row=2, max_col=2, values_only=True):
+            if row and row[0] == 1:
+                has_row = True
+                break
+        if not has_row:
+            ws.append([1, 5, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+        wb.save(self.xlsx_path)
 
     def get_lead_minutes(self) -> int:
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT lead_minutes FROM settings WHERE id=1")
-            row = cur.fetchone()
-            return int(row[0]) if row else 5
+        """現在の事前通知分を取得（無ければ5）。"""
+        try:
+            wb = load_workbook(self.xlsx_path, data_only=True)
+            ws = wb[self.sheet_name]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0] == 1:
+                    val = int(row[1]) if row[1] is not None else 5
+                    return max(3, min(15, val))  # 異常値をはじく
+        except Exception as e:
+            logger.warning(f"Excel読み込みに失敗しました。既定値(5)を返します: {e}")
+        return 5
 
     def set_lead_minutes(self, minutes: int) -> None:
+        """事前通知分を設定（3〜15）。UTF-8文字列で時刻を書込。"""
         if not (3 <= minutes <= 15):
             raise ValueError("lead_minutes は 3〜15 の範囲で指定してください")
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE settings SET lead_minutes=?, updated_at=datetime('now') WHERE id=1",
-                (minutes,),
-            )
-            conn.commit()
+        self.ensure()
+        wb = load_workbook(self.xlsx_path)
+        ws = wb[self.sheet_name]
 
-store = SettingsStore(DB_PATH)
+        # id=1 の行を探して更新
+        target_row = None
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(row=r, column=1).value == 1:
+                target_row = r
+                break
+        if target_row is None:
+            target_row = ws.max_row + 1
+            ws.cell(row=target_row, column=1, value=1)
+
+        ws.cell(row=target_row, column=2, value=minutes)
+        ts = self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST'))
+        ws.cell(row=target_row, column=3, value=ts)
+        ws.cell(row=target_row, column=4, value="UTF-8")
+        wb.save(self.xlsx_path)
+
+store = SettingsStore(EXCEL_PATH)
 CONFIG_UPDATED = asyncio.Event()  # 設定変更をスケジューラへ即時反映
 
 # =====================
@@ -172,6 +225,8 @@ async def ensure_channel(client: discord.Client, channel_id: int) -> discord.abc
 async def safe_send(channel: discord.abc.Messageable, content: str) -> None:
     """送信＋例外処理（ログは日本語）。"""
     try:
+        # 送信テキストは明示的にUTF-8検証（念のため）
+        content.encode("utf-8")
         await channel.send(content)
         logger.info("メッセージを送信しました。")
     except Exception as e:
@@ -229,7 +284,7 @@ async def scheduler() -> None:
 
         # 送信
         if kind == "pre":
-            await safe_send(channel, f"🪙 メタルーキーまであと{lead_used}分です！")
+            await safe_send(channel, f"🌈 メタルーキーまであと{lead_used}分です！")
         else:
             await safe_send(channel, MESSAGE_MAIN)
 
@@ -341,7 +396,7 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN or CHANNEL_ID == 0:
         raise SystemExit("環境変数 DISCORD_TOKEN / CHANNEL_ID を設定してください（.env 参照）")
 
-    # 先に DB を確実に初期化
+    # 先に Excel を確実に初期化
     store.ensure()
 
     bot.run(DISCORD_TOKEN)
