@@ -16,8 +16,5 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-# EXPOSE は任意（HTTPサーバを立てないなら不要）
-# EXPOSE 8080
-
 SHELL ["/bin/sh", "-lc"]
 CMD python -u "${PY_ENTRYPOINT}"
