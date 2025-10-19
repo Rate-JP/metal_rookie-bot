@@ -108,7 +108,7 @@ class SettingsStore:
             ws = wb.active
             ws.title = self.sheet_name
             ws.append(["id", "lead_minutes", "updated_at", "encoding"])
-            ws.append([1, 5, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+            ws.append([1, 10, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
             wb.save(self.xlsx_path)
             return
 
