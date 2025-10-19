@@ -36,7 +36,7 @@ SHEET_NAME = os.getenv("SHEET_NAME", "settings")
 # 値域・制限
 LEAD_MIN = 3
 LEAD_MAX = 15
-DEFAULT_LEAD = 5
+DEFAULT_LEAD = 10
 MAX_DISCORD_MESSAGE_LEN = 2000
 
 # ---------------------
