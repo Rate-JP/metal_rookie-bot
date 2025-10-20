@@ -54,6 +54,9 @@ async def main():
 
     try:
         # ★ ここが重要：await する
+        await bot.load_extension("cogs.update")
+        logger.info("拡張をロードしました: cogs.update")
+
         await bot.load_extension("cogs.notice")
         logger.info("拡張をロードしました: cogs.notice")
 

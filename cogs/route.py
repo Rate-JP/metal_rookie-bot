@@ -1,26 +1,13 @@
-# cogs/dqx_route.py
-# -*- coding: utf-8 -*-
-"""
-Discord Cog: DQX Route
-- dqx_route.py のロジックを Discord コマンド化
-- notice.py の構成（環境変数, Cog, async setup, 起動時ヘルプ）に準拠
-
-依存:
-    pip install pandas openpyxl
-
-環境変数:
-    PREFIX                (既定: "!")
-    DQX_DB_PATH           (既定: "dqx_map_data.xlsx")
-    DQX_ROUTE_CHANNEL_ID  (既定: 未設定)  # 未設定時は CHANNEL_ID をフォールバックで使用
-    CHANNEL_ID            (フォールバック用)
-"""
+# cogs/route.py
 import os
 import logging
 from typing import Dict, List, Tuple, Optional
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 import unicodedata
 import difflib
+import heapq
+import time
 
 import discord
 from discord.ext import commands
@@ -39,55 +26,21 @@ logger = logging.getLogger("dqx-route-bot")
 PREFIX = os.getenv("PREFIX", "!")
 DQX_DB_PATH = os.getenv("DQX_DB_PATH", "dqx_map_data.xlsx")
 
-# 起動時ヘルプの送信先チャンネルID（DQX_ROUTE_CHANNEL_ID優先、無ければCHANNEL_IDを使用）
 def _int_env(name: str, default: int = 0) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
 
+# 起動時ヘルプの送信先チャンネルID（DQX_ROUTE_CHANNEL_ID優先、無ければCHANNEL_IDを使用）
 DQX_ROUTE_CHANNEL_ID = _int_env("DQX_ROUTE_CHANNEL_ID", 0) or _int_env("CHANNEL_ID", 0)
 
 # ---------------------
-# 送信ユーティリティ
+# 定数 / 既定ハブ
 # ---------------------
-async def ensure_channel(client: discord.Client, channel_id: int) -> discord.abc.Messageable:
-    ch = client.get_channel(channel_id)
-    if ch is None:
-        ch = await client.fetch_channel(channel_id)
-    return ch
+MAX_DISCORD_LEN = 2000  # Discord のメッセージ上限
+CHUNK_SAFE = 1990       # 余白をもたせて分割
 
-async def safe_send(channel: discord.abc.Messageable, content: str) -> None:
-    try:
-        content.encode("utf-8")
-        await channel.send(content)
-        logger.info("メッセージを送信しました。")
-    except Exception as e:
-        logger.exception(f"メッセージ送信に失敗しました: {e}")
-
-async def safe_reply(ctx: commands.Context, content: str) -> None:
-    try:
-        content.encode("utf-8")
-        await ctx.reply(content, mention_author=False)
-    except Exception as e:
-        logger.exception(f"返信に失敗: {e}")
-
-def build_help_text() -> str:
-    return "\n".join(
-        [
-            "**【NEW】🧭 DQX ルート検索コマンド**",
-            f"• `{PREFIX}route <目的地>` — ハブ→目的地の徒歩ルートと推奨ルーラ地点を表示",
-            f"• `{PREFIX}route_suggest <キーワード>` — 曖昧な地名から候補を提案",
-            f"• `{PREFIX}route_help` — このヘルプを表示",
-            "",
-        ]
-    )
-
-# ---------------------
-# ルーティング・ロジック（元 dqx_route.py を移植）
-# ---------------------
-
-# 既定ハブ（continents シートが無い場合のフォールバック）
 DEFAULT_HUBS = {
     "ドワチャッカ大陸": "岳都ガタラ",
     "プクランド大陸": "オルフェアの町",
@@ -99,114 +52,102 @@ DEFAULT_HUBS = {
     "その他": "港町レンドア",
 }
 
-def _normalize_from_nodes_edges(xlsx_path: Path):
-    """nodes/edges 形式から areas/edges/continents/aliases を生成して返す。"""
-    nodes_df = pd.read_excel(xlsx_path, sheet_name="nodes")
-    edges_nodes_df = pd.read_excel(xlsx_path, sheet_name="edges")
+# ---------------------
+# 送信ユーティリティ
+# ---------------------
+def chunk_text(text: str, limit: int = CHUNK_SAFE) -> List[str]:
+    """Discord 文字数上限に抵触しないよう、適宜改行で分割する。"""
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    buf = []
+    size = 0
+    for line in text.splitlines(keepends=True):
+        if size + len(line) > limit and buf:
+            parts.append("".join(buf))
+            buf, size = [], 0
+        if len(line) > limit:  # 1行が極端に長い場合は強制分割
+            while len(line) > limit:
+                parts.append(line[:limit])
+                line = line[limit:]
+            if line:
+                buf.append(line)
+                size = len(line)
+        else:
+            buf.append(line)
+            size += len(line)
+    if buf:
+        parts.append("".join(buf))
+    return parts
 
-    areas_rows = []
-    name2id = {}
-    for i, row in nodes_df.reset_index(drop=True).iterrows():
-        nid = 10_000 + i
-        nm = str(row["name"])
-        name2id[nm] = nid
-        areas_rows.append({
-            "id": nid,
-            "name": nm,
-            "continent": str(row.get("continent", "")),
-            "version": str(row.get("version", "")),
-            "category": str(row.get("category", "")),
-            "is_rura": int(row.get("is_rura", 0)),
-        })
-    areas_df = pd.DataFrame(areas_rows)
+async def ensure_channel(client: discord.Client, channel_id: int) -> discord.abc.Messageable:
+    ch = client.get_channel(channel_id)
+    if ch is None:
+        ch = await client.fetch_channel(channel_id)
+    return ch
 
-    e_rows = []
-    for _, r in edges_nodes_df.iterrows():
-        su = str(r["src"])
-        sv = str(r["dst"])
-        if su not in name2id or sv not in name2id:
-            continue
-        w = r.get("weight", 1)
-        try:
-            w = int(w)
-        except Exception:
-            w = 1
-        e_rows.append({"from_id": name2id[su], "to_id": name2id[sv], "weight": w, "via": str(r.get("note", "徒歩"))})
-    edges_df = pd.DataFrame(e_rows)
-
-    conts = []
-    for cont in sorted(areas_df["continent"].dropna().unique()):
-        hub = DEFAULT_HUBS.get(cont, "")
-        if hub and hub in name2id:
-            conts.append({"continent": cont, "default_hub": hub})
-            continue
-        sub = areas_df[(areas_df["continent"] == cont) & (areas_df["is_rura"] == 1)]
-        if not sub.empty:
-            conts.append({"continent": cont, "default_hub": str(sub.iloc[0]["name"])})
-            continue
-        sub2 = areas_df[areas_df["continent"] == cont]
-        if not sub2.empty:
-            conts.append({"continent": cont, "default_hub": str(sub2.iloc[0]["name"])})
-    continents_df = pd.DataFrame(conts)
-
+async def safe_send(channel: discord.abc.Messageable, content: str, *, silent: bool = False) -> None:
+    """チャンネルへ送信（分割＆サイレント対応）"""
     try:
-        aliases_df = pd.read_excel(xlsx_path, sheet_name="aliases")
-        if not {"alias","canonical"}.issubset(set(aliases_df.columns)):
-            aliases_df = pd.DataFrame(columns=["alias", "canonical"])
-    except Exception:
-        aliases_df = pd.DataFrame(columns=["alias", "canonical"])
+        content.encode("utf-8")
+        for part in chunk_text(content):
+            await channel.send(part, silent=silent)
+        logger.info("メッセージを送信しました。")
+    except Exception as e:
+        logger.exception(f"メッセージ送信に失敗しました: {e}")
 
-    return continents_df, areas_df, edges_df, aliases_df
+async def safe_reply(ctx: commands.Context, content: str, *, silent: bool = False) -> None:
+    """コマンドへの返信（分割＆サイレント対応）"""
+    try:
+        content.encode("utf-8")
+        for part in chunk_text(content):
+            await ctx.reply(part, mention_author=False, silent=silent)
+    except Exception as e:
+        logger.exception(f"返信に失敗: {e}")
 
-def load_db(xlsx_path: Path):
-    xl = pd.ExcelFile(xlsx_path)
-    sheets = set(xl.sheet_names)
+async def safe_reply_to_message(message: discord.Message, content: str, *, silent: bool = False) -> None:
+    """任意メッセージに対する返信（分割＆サイレント対応）"""
+    try:
+        content.encode("utf-8")
+        for part in chunk_text(content):
+            await message.reply(part, mention_author=False, silent=silent)
+    except Exception as e:
+        logger.exception(f"返信に失敗: {e}")
 
-    if {"continents", "areas", "edges"}.issubset(sheets):
-        continents = pd.read_excel(xlsx_path, sheet_name="continents")
-        areas = pd.read_excel(xlsx_path, sheet_name="areas")
-        edges = pd.read_excel(xlsx_path, sheet_name="edges")
-        try:
-            aliases = pd.read_excel(xlsx_path, sheet_name="aliases")
-        except Exception:
-            aliases = pd.DataFrame(columns=["alias", "canonical"])
-        return continents, areas, edges, aliases
+def build_help_text() -> str:
+    return "\n".join(
+        [
+            "**🧭 DQX ルート検索コマンド**",
+            f"• `{PREFIX}route <目的地>` — ハブ→目的地の徒歩ルートと推奨ルーラ地点を表示",
+            f"• `{PREFIX}route_suggest <キーワード>` — 曖昧な地名から候補を提案",
+            f"• `{PREFIX}route_help` — このヘルプを表示",
+            "",
+        ]
+    )
 
-    if {"nodes", "edges"}.issubset(sheets):
-        return _normalize_from_nodes_edges(xlsx_path)
+# ---------------------
+# @silent 検出ユーティリティ
+# ---------------------
+def strip_silent_prefix(s: str) -> Tuple[bool, str]:
+    """
+    先頭の '@silent'（大文字小文字無視）を取り除く。
+    区切りの空白・全角空白・コロン（:：）も許容。
+    戻り値: (検出したか, 取り除いた後の文字列)
+    """
+    if not s:
+        return False, s
+    t = s.lstrip()
+    low = t.lower()
+    if low.startswith("@silent"):
+        rest = t[len("@silent"):]
+        # 区切り文字を除去
+        rest = rest.lstrip(" :：　\t")
+        return True, rest
+    return False, s
 
-    raise ValueError("未対応の Excel スキーマです。'continents/areas/edges' または 'nodes/edges' を含めてください。")
-
-def build_graph(edges_df: pd.DataFrame) -> Dict[int, List[Tuple[int, int]]]:
-    g = defaultdict(list)
-    for _, row in edges_df.iterrows():
-        u, v = int(row["from_id"]), int(row["to_id"])
-        w = int(row.get("weight", 1))
-        g[u].append((v, w))
-        g[v].append((u, w))
-    return g
-
-def bfs_shortest_path(g: Dict[int, List[Tuple[int, int]]], start: int, goal: int) -> Optional[List[int]]:
-    q = deque([start])
-    parent = {start: None}
-    while q:
-        u = q.popleft()
-        if u == goal:
-            break
-        for v, _w in g.get(u, []):
-            if v not in parent:
-                parent[v] = u
-                q.append(v)
-    if goal not in parent:
-        return None
-    path = []
-    cur = goal
-    while cur is not None:
-        path.append(cur)
-        cur = parent[cur]
-    path.reverse()
-    return path
-
+# ---------------------
+# 正規化 & サジェスト
+# ---------------------
 def _canon(s: str) -> str:
     """類似度評価用に軽く正規化（NFKC、空白/中黒/ハイフン/「の」を除去）。"""
     if s is None:
@@ -233,7 +174,7 @@ def resolve_name(name: str, areas_df: pd.DataFrame, aliases_df: pd.DataFrame) ->
         return cands[0]
     return None
 
-def suggest_names(query: str, areas_df: pd.DataFrame, aliases_df: pd.DataFrame, k: int = 3, min_score: float = 0.55) -> List[str]:
+def suggest_names(query: str, areas_df: pd.DataFrame, _aliases_df: pd.DataFrame, k: int = 3, min_score: float = 0.55) -> List[str]:
     names = list(pd.Series(areas_df["name"].astype(str)).dropna().unique())
     qn = _canon(query)
     scored = []
@@ -248,81 +189,326 @@ def suggest_names(query: str, areas_df: pd.DataFrame, aliases_df: pd.DataFrame, 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [nm for sc, nm in scored if sc >= min_score][:k]
 
+# ---------------------
+# Excel 読み込み / 正規化
+# ---------------------
+def _read_excel(path: Path, sheet: str) -> pd.DataFrame:
+    return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
+
+def _normalize_from_nodes_edges(xlsx_path: Path):
+    """nodes/edges 形式から areas/edges/continents/aliases を生成して返す。"""
+    nodes_df = _read_excel(xlsx_path, "nodes")
+    edges_nodes_df = _read_excel(xlsx_path, "edges")
+
+    areas_rows = []
+    name2id = {}
+    for i, row in nodes_df.reset_index(drop=True).iterrows():
+        nid = 10_000 + i
+        nm = str(row["name"])
+        name2id[nm] = nid
+        areas_rows.append({
+            "id": nid,
+            "name": nm,
+            "continent": str(row.get("continent", "")),
+            "version": str(row.get("version", "")),
+            "category": str(row.get("category", "")),
+            "is_rura": int(row.get("is_rura", 0) or 0),
+        })
+    areas_df = pd.DataFrame(areas_rows)
+
+    e_rows = []
+    for _, r in edges_nodes_df.iterrows():
+        su = str(r["src"])
+        sv = str(r["dst"])
+        if su not in name2id or sv not in name2id:
+            continue
+        w = r.get("weight", 1)
+        try:
+            w = int(w)
+        except Exception:
+            w = 1
+        e_rows.append({"from_id": name2id[su], "to_id": name2id[sv], "weight": w, "via": str(r.get("note", "徒歩"))})
+    edges_df = pd.DataFrame(e_rows)
+
+    conts = []
+    for cont in sorted(areas_df["continent"].dropna().unique()):
+        hub = DEFAULT_HUBS.get(cont, "")
+        if hub and hub in name2id:
+            conts.append({"continent": cont, "default_hub": hub})
+            continue
+        sub = areas_df[(areas_df["continent"] == cont) & (areas_df["is_rura"].astype(int) == 1)]
+        if not sub.empty:
+            conts.append({"continent": cont, "default_hub": str(sub.iloc[0]["name"])})
+            continue
+        sub2 = areas_df[areas_df["continent"] == cont]
+        if not sub2.empty:
+            conts.append({"continent": cont, "default_hub": str(sub2.iloc[0]["name"])})
+    continents_df = pd.DataFrame(conts)
+
+    try:
+        aliases_df = _read_excel(xlsx_path, "aliases")
+        if not {"alias", "canonical"}.issubset(set(aliases_df.columns)):
+            aliases_df = pd.DataFrame(columns=["alias", "canonical"])
+    except Exception:
+        aliases_df = pd.DataFrame(columns=["alias", "canonical"])
+
+    return continents_df, areas_df, edges_df, aliases_df
+
+def load_db(xlsx_path: Path):
+    xl = pd.ExcelFile(xlsx_path, engine="openpyxl")
+    sheets = set(xl.sheet_names)
+
+    if {"continents", "areas", "edges"}.issubset(sheets):
+        continents = _read_excel(xlsx_path, "continents")
+        areas = _read_excel(xlsx_path, "areas")
+        edges = _read_excel(xlsx_path, "edges")
+        try:
+            aliases = _read_excel(xlsx_path, "aliases")
+        except Exception:
+            aliases = pd.DataFrame(columns=["alias", "canonical"])
+    elif {"nodes", "edges"}.issubset(sheets):
+        continents, areas, edges, aliases = _normalize_from_nodes_edges(xlsx_path)
+    else:
+        raise ValueError("未対応の Excel スキーマです。'continents/areas/edges' または 'nodes/edges' を含めてください。")
+
+    # 型の整備
+    if "is_rura" not in areas.columns:
+        areas["is_rura"] = 0
+    areas["is_rura"] = pd.to_numeric(areas["is_rura"], errors="coerce").fillna(0).astype(int)
+    areas["id"] = pd.to_numeric(areas["id"], errors="coerce").astype(int)
+
+    for col in ("from_id", "to_id"):
+        edges[col] = pd.to_numeric(edges[col], errors="coerce").astype(int)
+    if "weight" not in edges.columns:
+        edges["weight"] = 1
+    edges["weight"] = pd.to_numeric(edges["weight"], errors="coerce").fillna(1).astype(int)
+
+    return continents, areas, edges, aliases
+
+# ---------------------
+# グラフユーティリティ
+# ---------------------
+def build_graph(edges_df: pd.DataFrame) -> Dict[int, List[Tuple[int, int]]]:
+    g: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for _, row in edges_df.iterrows():
+        u, v = int(row["from_id"]), int(row["to_id"])
+        w = int(row.get("weight", 1))
+        g[u].append((v, w))
+        g[v].append((u, w))
+    return g
+
+def bfs_shortest_path(g: Dict[int, List[Tuple[int, int]]], start: int, goal: int) -> Optional[List[int]]:
+    """後方互換のために残置。内部では未使用（重みを考慮するため Dijkstra を採用）。"""
+    from collections import deque
+    q = deque([start])
+    parent = {start: None}
+    while q:
+        u = q.popleft()
+        if u == goal:
+            break
+        for v, _w in g.get(u, []):
+            if v not in parent:
+                parent[v] = u
+                q.append(v)
+    if goal not in parent:
+        return None
+    path = []
+    cur = goal
+    while cur is not None:
+        path.append(cur)
+        cur = parent[cur]
+    path.reverse()
+    return path
+
+def _reconstruct_path(parent: Dict[int, Optional[int]], start: int, goal: int) -> Optional[List[int]]:
+    """parent は start からの経路木（parent[start] is None）"""
+    if goal not in parent:
+        return None
+    path = []
+    cur = goal
+    while cur is not None:
+        path.append(cur)
+        cur = parent[cur]
+    path.reverse()
+    if path and path[0] == start:
+        return path
+    return None
+
+def dijkstra_all(g: Dict[int, List[Tuple[int, int]]], start: int) -> Tuple[Dict[int, int], Dict[int, Optional[int]]]:
+    """単一始点最短路（重み >= 1 前提）"""
+    dist: Dict[int, int] = {start: 0}
+    parent: Dict[int, Optional[int]] = {start: None}
+    pq: List[Tuple[int, int]] = [(0, start)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d != dist[u]:
+            continue
+        for v, w in g.get(u, []):
+            nd = d + w
+            if v not in dist or nd < dist[v]:
+                dist[v] = nd
+                parent[v] = u
+                heapq.heappush(pq, (nd, v))
+    return dist, parent
+
+def dijkstra_shortest_path(g: Dict[int, List[Tuple[int, int]]], start: int, goal: int) -> Optional[List[int]]:
+    dist, parent = dijkstra_all(g, start)
+    if goal not in dist:
+        return None
+    return _reconstruct_path(parent, start, goal)
+
+# ---------------------
+# ルーティングの補助
+# ---------------------
+def resolve_hub_for_continent(dest_cont: str, continents_df: pd.DataFrame, areas_df: pd.DataFrame, name2id: Dict[str, int]) -> Optional[str]:
+    row = continents_df.loc[continents_df["continent"] == dest_cont]
+    if not row.empty:
+        return str(row.iloc[0]["default_hub"])
+
+    # continents に無い場合はフォールバック
+    hub_name = DEFAULT_HUBS.get(dest_cont, None)
+    if hub_name and hub_name in name2id:
+        return hub_name
+
+    # 大陸内のルーラ地点があればそれを
+    sub = areas_df[(areas_df["continent"] == dest_cont) & (areas_df["is_rura"].astype(int) == 1)]
+    if not sub.empty:
+        return str(sub.iloc[0]["name"])
+
+    # それもなければ最初のエリア名
+    sub2 = areas_df[areas_df["continent"] == dest_cont]
+    if not sub2.empty:
+        return str(sub2.iloc[0]["name"])
+
+    return None
+
 def path_to_names(path: List[int], id2name: Dict[int, str]) -> List[str]:
     return [id2name[i] for i in path]
 
-def compute_route_text(dest_name: str, db_path: Path) -> str:
-    """成功時は見出し付きの整形テキスト、未発見時は候補提示テキストを返す。"""
-    continents_df, areas_df, edges_df, aliases_df = load_db(db_path)
-    id2name = {int(r["id"]): str(r["name"]) for _, r in areas_df.iterrows()}
-    name2id = {v: k for k, v in id2name.items()}
-    id2continent = {int(r["id"]): str(r["continent"]) for _, r in areas_df.iterrows()}
-    id2isrura = {int(r["id"]): int(r.get("is_rura", 0)) for _, r in areas_df.iterrows()}
+# ---------------------
+# DB キャッシュ
+# ---------------------
+class MapDB:
+    """Excel DB を監視し、変更があれば再読み込み。大陸サブグラフもキャッシュ。"""
+    def __init__(self, path: Path):
+        self.path = path
+        self._mtime: Optional[float] = None
+        self.continents: pd.DataFrame = pd.DataFrame()
+        self.areas: pd.DataFrame = pd.DataFrame()
+        self.edges: pd.DataFrame = pd.DataFrame()
+        self.aliases: pd.DataFrame = pd.DataFrame()
+        self.id2name: Dict[int, str] = {}
+        self.name2id: Dict[str, int] = {}
+        self.id2continent: Dict[int, str] = {}
+        self.id2isrura: Dict[int, int] = {}
+        self._graphs_by_continent: Dict[str, Dict[int, List[Tuple[int, int]]]] = {}
+        self._load()
 
-    resolved_dest = resolve_name(dest_name, areas_df, aliases_df)
+    def _load(self) -> None:
+        if not self.path.exists():
+            raise FileNotFoundError(f"DB が見つかりません: {self.path}")
+        self.continents, self.areas, self.edges, self.aliases = load_db(self.path)
+        self.id2name = {int(r["id"]): str(r["name"]) for _, r in self.areas.iterrows()}
+        self.name2id = {v: k for k, v in self.id2name.items()}
+        self.id2continent = {int(r["id"]): str(r["continent"]) for _, r in self.areas.iterrows()}
+        self.id2isrura = {int(r["id"]): int(r.get("is_rura", 0)) for _, r in self.areas.iterrows()}
+        self._graphs_by_continent.clear()
+        self._mtime = self.path.stat().st_mtime
+        logger.info("DB を読み込みました。areas=%d edges=%d", len(self.areas), len(self.edges))
+
+    def maybe_reload(self) -> None:
+        try:
+            m = self.path.stat().st_mtime
+        except FileNotFoundError:
+            raise FileNotFoundError(f"DB が見つかりません: {self.path}")
+        if self._mtime is None or m > self._mtime:
+            logger.info("DB の更新を検知: 再読み込みします。")
+            self._load()
+
+    def subgraph(self, continent: str) -> Dict[int, List[Tuple[int, int]]]:
+        if continent in self._graphs_by_continent:
+            return self._graphs_by_continent[continent]
+        same_ids = set(self.areas.loc[self.areas["continent"] == continent, "id"].astype(int))
+        sub_edges = self.edges[
+            self.edges["from_id"].isin(same_ids) & self.edges["to_id"].isin(same_ids)
+        ]
+        g = build_graph(sub_edges)
+        self._graphs_by_continent[continent] = g
+        return g
+
+# ---------------------
+# ルート作成（メイン）
+# ---------------------
+def compute_route_text(dest_name: str, db_path: Path, db: Optional[MapDB] = None) -> str:
+    """
+    成功時は見出し付きの整形テキスト、未発見時は候補提示テキストを返す。
+    ※ 重みつき最短経路（Dijkstra）で徒歩ルート/ルーラ推奨を算出。
+    """
+    db = db or MapDB(db_path)
+    db.maybe_reload()
+
+    resolved_dest = resolve_name(dest_name, db.areas, db.aliases)
     if not resolved_dest:
-        suggestions = suggest_names(dest_name, areas_df, aliases_df, k=5, min_score=0.55)
+        suggestions = suggest_names(dest_name, db.areas, db.aliases, k=5, min_score=0.55)
         if suggestions:
             return "❓ 目的地が見つかりませんでした。\n**もしかして**: " + " / ".join(suggestions)
-        close = [n for n in areas_df["name"].astype(str) if dest_name in n]
+        close = [n for n in db.areas["name"].astype(str) if dest_name in n]
         return "❓ 目的地が見つかりませんでした。\n候補: " + (", ".join(close) if close else "（候補なし）")
 
-    dest_id = name2id[resolved_dest]
-    dest_cont = id2continent[dest_id]
+    dest_id = db.name2id[resolved_dest]
+    dest_cont = db.id2continent.get(dest_id, "")
 
-    row = continents_df.loc[continents_df["continent"] == dest_cont]
-    if row.empty:
-        hub_name = DEFAULT_HUBS.get(dest_cont, None)
-        if not hub_name or hub_name not in name2id:
-            sub = areas_df[(areas_df["continent"] == dest_cont) & (areas_df.get("is_rura", 0) == 1)]
-            if not sub.empty:
-                hub_name = str(sub.iloc[0]["name"])
-            else:
-                sub2 = areas_df[areas_df["continent"] == dest_cont]
-                if sub2.empty:
-                    return f"⚠️ 大陸データが見つかりません: {dest_cont}"
-                hub_name = str(sub2.iloc[0]["name"])
-    else:
-        hub_name = str(row.iloc[0]["default_hub"])
-
-    if hub_name not in name2id:
+    hub_name = resolve_hub_for_continent(dest_cont, db.continents, db.areas, db.name2id)
+    if not hub_name:
+        return f"⚠️ 大陸データが見つかりません: {dest_cont}"
+    if hub_name not in db.name2id:
         return f"⚠️ ハブ地点が areas に未登録です: {hub_name}"
-    hub_id = name2id[hub_name]
+    hub_id = db.name2id[hub_name]
 
-    same_cont_ids = set(areas_df.loc[areas_df["continent"] == dest_cont, "id"].astype(int))
-    sub_edges = edges_df[edges_df[["from_id", "to_id"]].astype(int).apply(
-        lambda x: x["from_id"] in same_cont_ids and x["to_id"] in same_cont_ids, axis=1)]
-    g = build_graph(sub_edges)
+    # 大陸サブグラフを構築
+    g = db.subgraph(dest_cont)
 
-    walk_path_ids = bfs_shortest_path(g, hub_id, dest_id)
+    # 徒歩ルート（ハブ→目的地）
+    walk_path_ids = dijkstra_shortest_path(g, hub_id, dest_id)
     if not walk_path_ids:
         walk_route = "（未接続：徒歩ルートがDBにありません）"
     else:
-        walk_names = path_to_names(walk_path_ids, id2name)
+        walk_names = path_to_names(walk_path_ids, db.id2name)
         walk_route = " → ".join(walk_names)
 
-    if id2isrura.get(dest_id, 0) == 1:
+    # 推奨ルーラ
+    if db.id2isrura.get(dest_id, 0) == 1:
         rura_point = resolved_dest
         rura_walk = ""
     else:
-        rura_candidates = [int(r["id"]) for _, r in areas_df.loc[
-            (areas_df["continent"] == dest_cont) & (areas_df.get("is_rura", 0) == 1)
-        ].iterrows()]
+        # 目的地から単一始点 Dijkstra を一度だけ回して最短ルーラ候補を決定
+        dists_from_dest, parent_from_dest = dijkstra_all(g, dest_id)
+        rura_candidates = [
+            int(r["id"]) for _, r in db.areas.loc[
+                (db.areas["continent"] == dest_cont) & (db.areas["is_rura"].astype(int) == 1)
+            ].iterrows()
+        ]
         best = None
         for rid in rura_candidates:
-            p = bfs_shortest_path(g, rid, dest_id)
-            if p:
-                d = len(p) - 1
+            if rid in dists_from_dest:
+                d = dists_from_dest[rid]
                 if (best is None) or (d < best[0]):
-                    best = (d, p)
+                    best = (d, rid)
         if best is None:
             rura_point = "(同大陸に徒歩接続されたルーラ地点がDB未定義)"
             rura_walk = ""
         else:
-            _, pids = best
-            path_names = path_to_names(pids, id2name)
-            rura_point = path_names[0]
-            rura_walk = " → ".join(path_names[1:]) if len(path_names) >= 2 else ""
+            _d, rid = best
+            # parent は「dest から各頂点まで」の木なので、dest→rid を復元してから反転
+            path_dest_to_rid = _reconstruct_path(parent_from_dest, dest_id, rid)
+            if not path_dest_to_rid:
+                rura_point = db.id2name[rid]
+                rura_walk = ""
+            else:
+                path_rid_to_dest = list(reversed(path_dest_to_rid))
+                path_names = path_to_names(path_rid_to_dest, db.id2name)
+                rura_point = path_names[0]
+                rura_walk = " → ".join(path_names[1:]) if len(path_names) >= 2 else ""
 
     lines = [
         f"**🎯 目的地:** {resolved_dest}（大陸: {dest_cont}）",
@@ -343,6 +529,11 @@ class DQXRouteCog(commands.Cog):
         self.db_path = Path(DQX_DB_PATH)
         self.channel_id = DQX_ROUTE_CHANNEL_ID
         self._ready_once = False  # 起動時ヘルプの一度きり送信に使用
+        self._db: Optional[MapDB] = None
+        try:
+            self._db = MapDB(self.db_path)
+        except Exception as e:
+            logger.error("DB 初期化に失敗しました: %s", e)
 
     # ---- Bot ready → 起動時に一度だけヘルプ送付
     @commands.Cog.listener()
@@ -361,49 +552,143 @@ class DQXRouteCog(commands.Cog):
         except Exception as e:
             logger.exception(f"起動時ヘルプ送信に失敗しました: {e}")
 
+    # ---- @silent 前置き対応 & サイレント返信
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # 他BOTのメッセージは無視
+        if message.author.bot:
+            return
+
+        # UI上の「サイレント送信」フラグ（Suppress Notifications）
+        flag_silent = bool(getattr(message.flags, "suppress_notifications", False))
+        # メッセージ先頭の @silent 前置きを剥がす
+        text_silent, content_wo = strip_silent_prefix(message.content)
+        want_silent = flag_silent or text_silent
+
+        # @silent が付いている場合は、独自にプレフィックス前置きを許容してコマンドを処理
+        # 例: "@silent !route ウルベア地下遺跡"
+        if text_silent:
+            # route_help
+            if content_wo.startswith(f"{PREFIX}route_help"):
+                await safe_reply_to_message(message, build_help_text(), silent=True)
+                return
+
+            # route_suggest
+            if content_wo.startswith(f"{PREFIX}route_suggest"):
+                arg = content_wo[len(f"{PREFIX}route_suggest"):].strip()
+                if not self.db_path.exists():
+                    await safe_reply_to_message(
+                        message,
+                        f"❌ DB が見つかりません: `{self.db_path}`。環境変数 `DQX_DB_PATH` を確認してください。",
+                        silent=True,
+                    )
+                    return
+                try:
+                    if self._db is None:
+                        self._db = MapDB(self.db_path)
+                    else:
+                        self._db.maybe_reload()
+                    if not arg:
+                        await safe_reply_to_message(
+                            message, f"使い方: `{PREFIX}route_suggest <キーワード>` 例: `{PREFIX}route_suggest グレン`", silent=True
+                        )
+                        return
+                    cands = suggest_names(arg, self._db.areas, self._db.aliases, k=10, min_score=0.50)
+                    if cands:
+                        await safe_reply_to_message(message, "🔎 候補: " + " / ".join(cands), silent=True)
+                    else:
+                        await safe_reply_to_message(message, "🔎 候補なし", silent=True)
+                except Exception as e:
+                    logger.exception(e)
+                    await safe_reply_to_message(message, "❌ 候補生成でエラーが発生しました。ログを確認してください。", silent=True)
+                return
+
+            # route
+            if content_wo.startswith(f"{PREFIX}route"):
+                arg = content_wo[len(f"{PREFIX}route"):].strip()
+                if not self.db_path.exists():
+                    await safe_reply_to_message(
+                        message,
+                        f"❌ DB が見つかりません: `{self.db_path}`。環境変数 `DQX_DB_PATH` を確認してください。",
+                        silent=True,
+                    )
+                    return
+                try:
+                    if self._db is None:
+                        self._db = MapDB(self.db_path)
+                    else:
+                        self._db.maybe_reload()
+                    if not arg:
+                        await safe_reply_to_message(
+                            message, f"使い方: `{PREFIX}route <目的地>` 例: `{PREFIX}route ウルベア地下遺跡`", silent=True
+                        )
+                        return
+                    text = compute_route_text(arg, self.db_path, db=self._db)
+                    await safe_reply_to_message(message, text, silent=True)
+                except Exception as e:
+                    logger.exception(e)
+                    await safe_reply_to_message(message, "❌ ルート計算でエラーが発生しました。ログを確認してください。", silent=True)
+                return
+
+        # @silent 以外のメッセージは、この Cog では何もしない。
+        # （Bot の標準 on_message が process_commands を呼ぶので通常コマンドは動作します）
+
     @commands.command(name="route", aliases=["ルート"])
     async def route_cmd(self, ctx: commands.Context, *, dest: Optional[str] = None):
         """!route <目的地> — ルート検索"""
+        # 受信メッセージがサイレントならサイレント返信
+        silent = bool(getattr(ctx.message.flags, "suppress_notifications", False))
+
         if dest is None or not dest.strip():
-            await safe_reply(ctx, f"使い方: `{PREFIX}route <目的地>` 例: `{PREFIX}route ウルベア地下遺跡`")
+            await safe_reply(ctx, f"使い方: `{PREFIX}route <目的地>` 例: `{PREFIX}route ウルベア地下遺跡`", silent=silent)
             return
 
         if not self.db_path.exists():
-            await safe_reply(ctx, f"❌ DB が見つかりません: `{self.db_path}`。環境変数 `DQX_DB_PATH` を確認してください。")
+            await safe_reply(ctx, f"❌ DB が見つかりません: `{self.db_path}`。環境変数 `DQX_DB_PATH` を確認してください。", silent=silent)
             return
 
         try:
-            text = compute_route_text(dest.strip(), self.db_path)
-            await safe_reply(ctx, text)
+            if self._db is None:
+                self._db = MapDB(self.db_path)
+            else:
+                self._db.maybe_reload()
+            text = compute_route_text(dest.strip(), self.db_path, db=self._db)
+            await safe_reply(ctx, text, silent=silent)
         except Exception as e:
             logger.exception(e)
-            await safe_reply(ctx, "❌ ルート計算でエラーが発生しました。ログを確認してください。")
+            await safe_reply(ctx, "❌ ルート計算でエラーが発生しました。ログを確認してください。", silent=silent)
 
     @commands.command(name="route_suggest", aliases=["ルート候補"])
     async def route_suggest_cmd(self, ctx: commands.Context, *, query: Optional[str] = None):
         """!route_suggest <キーワード> — 候補を提案"""
+        silent = bool(getattr(ctx.message.flags, "suppress_notifications", False))
+
         if query is None or not query.strip():
-            await safe_reply(ctx, f"使い方: `{PREFIX}route_suggest <キーワード>` 例: `{PREFIX}route_suggest グレン`")
+            await safe_reply(ctx, f"使い方: `{PREFIX}route_suggest <キーワード>` 例: `{PREFIX}route_suggest グレン`", silent=silent)
             return
 
         if not self.db_path.exists():
-            await safe_reply(ctx, f"❌ DB が見つかりません: `{self.db_path}`。環境変数 `DQX_DB_PATH` を確認してください。")
+            await safe_reply(ctx, f"❌ DB が見つかりません: `{self.db_path}`。環境変数 `DQX_DB_PATH` を確認してください。", silent=silent)
             return
 
         try:
-            continents_df, areas_df, _edges_df, aliases_df = load_db(self.db_path)
-            cands = suggest_names(query.strip(), areas_df, aliases_df, k=10, min_score=0.50)
-            if cands:
-                await safe_reply(ctx, "🔎 候補: " + " / ".join(cands))
+            if self._db is None:
+                self._db = MapDB(self.db_path)
             else:
-                await safe_reply(ctx, "🔎 候補なし")
+                self._db.maybe_reload()
+            cands = suggest_names(query.strip(), self._db.areas, self._db.aliases, k=10, min_score=0.50)
+            if cands:
+                await safe_reply(ctx, "🔎 候補: " + " / ".join(cands), silent=silent)
+            else:
+                await safe_reply(ctx, "🔎 候補なし", silent=silent)
         except Exception as e:
             logger.exception(e)
-            await safe_reply(ctx, "❌ 候補生成でエラーが発生しました。ログを確認してください。")
+            await safe_reply(ctx, "❌ 候補生成でエラーが発生しました。ログを確認してください。", silent=silent)
 
     @commands.command(name="route_help")
     async def route_help_cmd(self, ctx: commands.Context):
-        await safe_reply(ctx, build_help_text())
+        silent = bool(getattr(ctx.message.flags, "suppress_notifications", False))
+        await safe_reply(ctx, build_help_text(), silent=silent)
 
 # 拡張エントリ（discord.py v2.x 用）
 async def setup(bot: commands.Bot):

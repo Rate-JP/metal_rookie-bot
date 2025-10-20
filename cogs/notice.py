@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 try:
     from openpyxl import Workbook, load_workbook
 except ImportError as e:
-    raise SystemExit("openpyxl が必要です。`pip install openpyxl` を実行してください。") from e
+    raise SystemExit(
+        "openpyxl が必要です。`pip install openpyxl` を実行してください。"
+    ) from e
 
 logger = logging.getLogger("metal-rookie-bot")
 
@@ -24,35 +26,47 @@ load_dotenv()
 PREFIX = os.getenv("PREFIX", "!")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-# Anchors / Interval は元コードと同一値を採用
+# ---------------------
+# グローバル変数
+# ---------------------
 JST = timezone(timedelta(hours=9))
 START_ANCHOR = datetime(2025, 10, 16, 12, 0, 0, tzinfo=JST)  # アンカーはJST（固定）
 INTERVAL = timedelta(hours=2, minutes=30)
+MESSAGE_MAIN = "🪙 メタルーキーの時間です！"
+EXCEL_PATH = "metal_rookie_bot.xlsx"
+SHEET_NAME = "settings"
 
-MESSAGE_MAIN = os.getenv("MESSAGE_MAIN", "🪙 メタルーキーの時間です！")
-EXCEL_PATH = os.getenv("EXCEL_PATH", "metal_rookie_bot.xlsx")
-SHEET_NAME = os.getenv("SHEET_NAME", "settings")
 
 # ---------------------
-# JSTユーティリティ（コンテナTZに依存しない）
+# JSTユーティリティ
 # ---------------------
 def to_jst(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(JST)
 
+
 def now_jst() -> datetime:
     return datetime.now(timezone.utc).astimezone(JST)
+
 
 def normalize_anchor(anchor: datetime) -> datetime:
     return to_jst(anchor)
 
-def next_boundary_after(now_jst_val: datetime, anchor_jst: datetime, interval: timedelta) -> datetime:
+
+def next_boundary_after(
+    now_jst_val: datetime, anchor_jst: datetime, interval: timedelta
+) -> datetime:
     if now_jst_val <= anchor_jst:
         return anchor_jst
     elapsed = now_jst_val - anchor_jst
     remainder = elapsed - (elapsed // interval) * interval
-    return now_jst_val if remainder == timedelta(0) else now_jst_val + (interval - remainder)
+    return (
+        now_jst_val
+        if remainder == timedelta(0)
+        else now_jst_val + (interval - remainder)
+    )
+
 
 def compute_next_event(
     now_jst_: datetime, anchor_jst: datetime, interval: timedelta, lead_min: int
@@ -73,6 +87,7 @@ def compute_next_event(
         return pre2, "pre", next_b, lead_min
     return next_b, "main", next_b, lead_min
 
+
 def human_delta(td: timedelta) -> str:
     secs = int(td.total_seconds())
     if secs < 0:
@@ -84,6 +99,7 @@ def human_delta(td: timedelta) -> str:
     if m > 0:
         return f"{m}分{s}秒"
     return f"{s}秒"
+
 
 # ---------------------
 # Excel 設定ストア
@@ -108,7 +124,14 @@ class SettingsStore:
             ws = wb.active
             ws.title = self.sheet_name
             ws.append(["id", "lead_minutes", "updated_at", "encoding"])
-            ws.append([1, 10, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+            ws.append(
+                [
+                    1,
+                    10,
+                    self._utf8(now_jst().strftime("%Y-%m-%d %H:%M:%S JST")),
+                    "UTF-8",
+                ]
+            )
             wb.save(self.xlsx_path)
             return
 
@@ -116,7 +139,9 @@ class SettingsStore:
         if self.sheet_name not in wb.sheetnames:
             ws = wb.create_sheet(self.sheet_name)
             ws.append(["id", "lead_minutes", "updated_at", "encoding"])
-            ws.append([1, 5, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+            ws.append(
+                [1, 5, self._utf8(now_jst().strftime("%Y-%m-%d %H:%M:%S JST")), "UTF-8"]
+            )
             wb.save(self.xlsx_path)
             return
 
@@ -129,7 +154,9 @@ class SettingsStore:
                 has_row = True
                 break
         if not has_row:
-            ws.append([1, 5, self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST')), "UTF-8"])
+            ws.append(
+                [1, 5, self._utf8(now_jst().strftime("%Y-%m-%d %H:%M:%S JST")), "UTF-8"]
+            )
         wb.save(self.xlsx_path)
 
     def get_lead_minutes(self) -> int:
@@ -161,21 +188,26 @@ class SettingsStore:
             ws.cell(row=target_row, column=1, value=1)
 
         ws.cell(row=target_row, column=2, value=minutes)
-        ts = self._utf8(now_jst().strftime('%Y-%m-%d %H:%M:%S JST'))
+        ts = self._utf8(now_jst().strftime("%Y-%m-%d %H:%M:%S JST"))
         ws.cell(row=target_row, column=3, value=ts)
         ws.cell(row=target_row, column=4, value="UTF-8")
         wb.save(self.xlsx_path)
 
+
 # ---------------------
 # 送信ユーティリティ
 # ---------------------
-async def ensure_channel(client: discord.Client, channel_id: int) -> discord.abc.Messageable:
+async def ensure_channel(
+    client: discord.Client, channel_id: int
+) -> discord.abc.Messageable:
     ch = client.get_channel(channel_id)
     if ch is None:
         ch = await client.fetch_channel(channel_id)
     return ch
 
+
 async def safe_send(channel: discord.abc.Messageable, content: str) -> None:
+    """スケジューラなど通常送信用（サイレント強制しない）"""
     try:
         content.encode("utf-8")
         await channel.send(content)
@@ -183,16 +215,39 @@ async def safe_send(channel: discord.abc.Messageable, content: str) -> None:
     except Exception as e:
         logger.exception(f"メッセージ送信に失敗しました: {e}")
 
+
+def was_silent(obj: "commands.Context | discord.Message") -> bool:
+    """
+    返信をサイレントにするかを判定。
+    - Discordの通知抑制フラグ（message.flags.suppress_notifications）
+    - メッセージ先頭のリテラル '@silent'
+    のどちらかが真なら True
+    """
+    try:
+        msg = obj.message if isinstance(obj, commands.Context) else obj
+        content = (msg.content or "").lstrip()
+        literal = content.lower().startswith("@silent")
+        flag = bool(
+            getattr(getattr(msg, "flags", None), "suppress_notifications", False)
+        )
+        return literal or flag
+    except Exception:
+        return False
+
+
 def build_help_text(lead_minutes: int) -> str:
     return "\n".join(
         [
-            "**📣 メタルーキーお知らせ機能**",
+            "**⏱️ メタルーキーお知らせ機能**",
             f"• `{PREFIX}notice_get` — 現在の事前通知（分前）を表示",
             f"• `{PREFIX}notice_set <3-15>` — 事前通知の分数を設定（3〜15 以外はエラー）",
             f"• `{PREFIX}next` — 次に発生する 事前通知/本通知 の JST 時刻と残り時間を表示",
             f"• `{PREFIX}help` — このヘルプを表示",
+            "",
+            "※ 返信をサイレントにしたい場合は、メッセージの先頭に `@silent` を付けて送信してください（例: `@silent !next`）",
         ]
     )
+
 
 # ---------------------
 # Cog: 通知機能
@@ -223,7 +278,7 @@ class MetalRookieCog(commands.Cog):
         # Excel 初期化
         self.store.ensure()
 
-        # 起動時ヘルプ
+        # 起動時ヘルプ（通常送信）
         try:
             ch = await ensure_channel(self.bot, self.channel_id)
             await safe_send(ch, build_help_text(self.store.get_lead_minutes()))
@@ -234,6 +289,56 @@ class MetalRookieCog(commands.Cog):
         # スケジューラ起動
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
+    # ---- 「@silent !xxx」にも反応させる on_message（※ process_commands を呼ばない）
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Bot 由来は無視
+        if message.author.bot:
+            return
+
+        content = (message.content or "").lstrip()
+
+        # 先頭に @silent が付いている場合でもコマンドを実行できるようにする
+        # 例: "@silent !next", "@silent   !notice_set 10"
+        if content.lower().startswith("@silent"):
+            rest = content[len("@silent") :].lstrip()
+            if rest.startswith(PREFIX):
+                # コマンド名と引数を取り出して、正式に invoke する
+                tokens = rest[len(PREFIX) :].strip().split()
+                if not tokens:
+                    return  # これ以上何もしない（※ここで return するのが重要）
+
+                cmd_name = tokens[0].lower()
+                # Allow only commands that belong to this cog to avoid double-handling with other cogs
+                _allowed_silent_cmds = {"notice_get", "notice_set", "next", "help"}
+                if cmd_name not in _allowed_silent_cmds:
+                    return
+                args = tokens[1:]
+
+                ctx = await self.bot.get_context(message)
+                cmd = self.bot.get_command(cmd_name)
+                if not cmd:
+                    return  # 不明コマンドの場合もここで終了
+
+                try:
+                    if cmd_name == "notice_set":
+                        minutes: Optional[int] = None
+                        if args:
+                            try:
+                                minutes = int(args[0])
+                            except ValueError:
+                                minutes = None
+                        await ctx.invoke(cmd, minutes=minutes)
+                    else:
+                        await ctx.invoke(cmd)
+                except Exception:
+                    logger.exception(f"@silent コマンド処理中にエラー")
+                finally:
+                    return  # ← 重要：ここで終了。**process_commands は呼ばない**
+
+        # @silent 以外のメッセージは、この Cog では何もしない。
+        # （Bot の標準 on_message が process_commands を呼ぶので通常コマンドは動作します）
+
     # ---- スケジューラ本体
     async def _scheduler_loop(self) -> None:
         ch = await ensure_channel(self.bot, self.channel_id)
@@ -243,12 +348,14 @@ class MetalRookieCog(commands.Cog):
         while not self.bot.is_closed():
             now = now_jst()
             lead = self.store.get_lead_minutes()
-            next_time, kind, boundary, lead_used = compute_next_event(now, self.anchor, self.interval, lead)
+            next_time, kind, boundary, lead_used = compute_next_event(
+                now, self.anchor, self.interval, lead
+            )
 
             logger.info(
                 "次の通知(JST): %s / 種別=%s / 事前=%s分前",
-                next_time.strftime('%Y-%m-%d %H:%M:%S'),
-                '事前通知' if kind == 'pre' else '本通知',
+                next_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "事前通知" if kind == "pre" else "本通知",
                 lead_used,
             )
 
@@ -262,7 +369,7 @@ class MetalRookieCog(commands.Cog):
             except asyncio.TimeoutError:
                 pass
 
-            # 送信
+            # 送信（スケジューラは通常送信）
             if kind == "pre":
                 await safe_send(ch, f"🌈 メタルーキーまであと{lead_used}分です！")
             else:
@@ -276,39 +383,58 @@ class MetalRookieCog(commands.Cog):
             )
             logger.info(
                 "次回(JST): %s / 種別=%s / 事前=%s分前",
-                next_time_after.strftime('%Y-%m-%d %H:%M:%S'),
-                '事前通知' if kind_after == 'pre' else '本通知',
+                next_time_after.strftime("%Y-%m-%d %H:%M:%S"),
+                "事前通知" if kind_after == "pre" else "本通知",
                 lead_after,
             )
 
-    # ---- コマンド群
+    # ---- コマンド群（@silent で来たら silent=True で返信）
     @commands.command(name="notice_get")
     async def notice_get(self, ctx: commands.Context) -> None:
         self.store.ensure()
         m = self.store.get_lead_minutes()
-        await ctx.reply(f"ℹ️ 現在の事前通知は **{m} 分前**です。", mention_author=False)
+        await ctx.reply(
+            f"ℹ️ 現在の事前通知は **{m} 分前**です。",
+            mention_author=False,
+            silent=was_silent(ctx),
+        )
 
     @commands.command(name="notice_set")
-    async def notice_set_cmd(self, ctx: commands.Context, minutes: Optional[int] = None) -> None:
+    async def notice_set_cmd(
+        self, ctx: commands.Context, minutes: Optional[int] = None
+    ) -> None:
         self.store.ensure()
         if minutes is None:
             await ctx.reply(
                 f"使い方: `{PREFIX}notice_set <分>` 例: `{PREFIX}notice_set 10`",
                 mention_author=False,
+                silent=was_silent(ctx),
             )
             return
 
         if not (3 <= minutes <= 15):
-            await ctx.reply("⚠️ 通知時間は **3〜15分前** でのみ設定できます。", mention_author=False)
+            await ctx.reply(
+                "⚠️ 通知時間は **3〜15分前** でのみ設定できます。",
+                mention_author=False,
+                silent=was_silent(ctx),
+            )
             return
 
         try:
             self.store.set_lead_minutes(minutes)
-            await ctx.reply(f"✅ 事前通知を **{minutes} 分前**に設定しました。", mention_author=False)
+            await ctx.reply(
+                f"✅ 事前通知を **{minutes} 分前**に設定しました。",
+                mention_author=False,
+                silent=was_silent(ctx),
+            )
             self.CONFIG_UPDATED.set()
         except Exception as e:
             logger.exception(e)
-            await ctx.reply("❌ 設定に失敗しました。ログを確認してください。", mention_author=False)
+            await ctx.reply(
+                "❌ 設定に失敗しました。ログを確認してください。",
+                mention_author=False,
+                silent=was_silent(ctx),
+            )
 
     @commands.command(name="next")
     async def next_cmd(self, ctx: commands.Context) -> None:
@@ -317,12 +443,17 @@ class MetalRookieCog(commands.Cog):
         lead = self.store.get_lead_minutes()
         anchor = self.anchor
 
-        next_time, kind, boundary, _ = compute_next_event(now, anchor, self.interval, lead)
+        next_time, kind, boundary, _ = compute_next_event(
+            now, anchor, self.interval, lead
+        )
         next_main = boundary
         pre_time = boundary - timedelta(minutes=lead)
-        next_pre = pre_time if now < pre_time else boundary + self.interval - timedelta(minutes=lead)
+        next_pre = (
+            pre_time
+            if now < pre_time
+            else boundary + self.interval - timedelta(minutes=lead)
+        )
 
-        eta_next = human_delta(next_time - now)
         eta_pre = human_delta(next_pre - now)
         eta_main = human_delta(next_main - now)
 
@@ -333,13 +464,16 @@ class MetalRookieCog(commands.Cog):
                 f"⏰ 次の本通知:   {next_main.strftime('%Y-%m-%d %H:%M:%S')} JST（あと {eta_main}）",
             ]
         )
-        await ctx.reply(text, mention_author=False)
+        await ctx.reply(text, mention_author=False, silent=was_silent(ctx))
 
     @commands.command(name="help")
     async def help_cmd(self, ctx: commands.Context) -> None:
         self.store.ensure()
         lead = self.store.get_lead_minutes()
-        await ctx.reply(build_help_text(lead), mention_author=False)
+        await ctx.reply(
+            build_help_text(lead), mention_author=False, silent=was_silent(ctx)
+        )
+
 
 # 拡張エントリ（discord.py v2.x では async 必須）
 async def setup(bot: commands.Bot):
